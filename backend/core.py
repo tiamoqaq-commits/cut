@@ -1,0 +1,129 @@
+"""Persistent local job queue and replaceable planning/storage contracts."""
+import json
+import os
+import random
+import sqlite3
+import uuid
+from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Protocol
+
+ROOT = Path(__file__).resolve().parents[1]
+# Minimal .env loader: real environment always wins; no external dependency.
+if (ROOT / '.env').exists():
+    for line in (ROOT / '.env').read_text().splitlines():
+        if line.strip() and not line.lstrip().startswith('#') and '=' in line:
+            key, value = line.split('=', 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"\''))
+DATA = Path(os.getenv('CUT_DATA_DIR', str(ROOT / 'data'))).resolve()
+DB = DATA / 'cut.sqlite3'
+
+def now():
+    return datetime.now(timezone.utc).isoformat()
+
+def connect():
+    DATA.mkdir(parents=True, exist_ok=True)
+    c = sqlite3.connect(DB, timeout=30)
+    c.row_factory = sqlite3.Row
+    c.execute('PRAGMA journal_mode=WAL')
+    c.executescript('''
+    CREATE TABLE IF NOT EXISTS assets (
+      id TEXT PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL,
+      duration REAL NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS jobs (
+      id TEXT PRIMARY KEY, batch_id TEXT NOT NULL, status TEXT NOT NULL,
+      progress INTEGER NOT NULL DEFAULT 0, request TEXT NOT NULL,
+      plan TEXT, output_key TEXT, error TEXT, attempts INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+    CREATE INDEX IF NOT EXISTS jobs_batch ON jobs(batch_id);
+    ''')
+    return c
+
+class Storage(Protocol):
+    """Cloud adapter must download to local_path and publish a local render atomically."""
+    def local_path(self, key: str) -> Path: ...
+    def publish(self, local_file: Path, key: str) -> None: ...
+
+class LocalStorage:
+    def local_path(self, key):
+        path = (DATA / key).resolve()
+        if DATA not in path.parents:
+            raise ValueError('Invalid storage key')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        return path
+
+    def publish(self, local_file, key):
+        os.replace(local_file, self.local_path(key))
+
+@dataclass
+class Clip:
+    asset_id: str
+    start: float
+    duration: float
+
+class Planner(Protocol):
+    def plan(self, assets: list[dict], request: dict, seed: str) -> list[Clip]: ...
+
+class RulePlanner:
+    """No AI claim: deterministic shuffled order and random valid cut offsets."""
+    def plan(self, assets, request, seed):
+        rng = random.Random(seed)
+        candidates = list(assets)
+        rng.shuffle(candidates)
+        remaining = request['duration']
+        clips = []
+        i = 0
+        while remaining > 0.01:
+            asset = candidates[i % len(candidates)]
+            duration = min(remaining, request['clip_seconds'], asset['duration'])
+            start = rng.uniform(0, max(0, asset['duration'] - duration))
+            clips.append(Clip(asset['id'], start, duration))
+            remaining -= duration
+            i += 1
+        return clips
+
+def providers():
+    # Fail closed: selecting an unimplemented provider must never silently use local.
+    if os.getenv('CUT_STORAGE', 'local') != 'local':
+        raise ValueError('Storage adapter not implemented; use CUT_STORAGE=local')
+    if os.getenv('CUT_PLANNER', 'rules') != 'rules':
+        raise ValueError('Planner adapter not implemented; use CUT_PLANNER=rules')
+    return LocalStorage(), RulePlanner()
+
+def job_json(row):
+    d = dict(row)
+    d['request'] = json.loads(d['request'])
+    d['plan'] = json.loads(d['plan']) if d['plan'] else None
+    d['download_url'] = '/api/jobs/' + d['id'] + '/output' if d['status'] == 'succeeded' else None
+    return d
+
+def validate_batch(body, c):
+    ids = body.get('asset_ids')
+    if not isinstance(ids, list) or not 1 <= len(ids) <= 30 or any(not isinstance(x, str) for x in ids):
+        raise ValueError('asset_ids must contain 1–30 uploaded asset IDs')
+    if len(set(ids)) != len(ids):
+        raise ValueError('asset_ids must be unique')
+    for key, low, high, default in [('count', 1, 20, 10), ('duration', 1, 60, 15), ('clip_seconds', 1, 10, 3)]:
+        value = body.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= high:
+            raise ValueError(f'{key} must be an integer from {low} to {high}')
+        body[key] = value
+    category = body.get('category', 'general')
+    if not isinstance(category, str) or not 1 <= len(category) <= 64:
+        raise ValueError('category must be 1–64 characters')
+    rows = c.execute('SELECT * FROM assets WHERE id IN (' + ','.join('?' for _ in ids) + ')', ids).fetchall()
+    if len(rows) != len(ids):
+        raise ValueError('Unknown asset ID')
+    if any(r['category'] != category for r in rows):
+        raise ValueError('All assets must match the batch category')
+    return {k: body[k] for k in ('asset_ids', 'count', 'duration', 'clip_seconds')} | {'category': category}
+
+def create_batch(body):
+    with connect() as c:
+        req = validate_batch(body, c)
+        batch = uuid.uuid4().hex
+        for _ in range(req['count']):
+            c.execute('INSERT INTO jobs(id,batch_id,status,request,created_at,updated_at) VALUES(?,?,?,?,?,?)',
+                      (uuid.uuid4().hex, batch, 'queued', json.dumps(req), now(), now()))
+    return batch
