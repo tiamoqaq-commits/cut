@@ -4,6 +4,8 @@ import os
 import random
 import sqlite3
 import uuid
+from contextlib import contextmanager
+import math
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,15 +24,23 @@ DB = DATA / 'cut.sqlite3'
 def now():
     return datetime.now(timezone.utc).isoformat()
 
+@contextmanager
 def connect():
     DATA.mkdir(parents=True, exist_ok=True)
     c = sqlite3.connect(DB, timeout=30)
+    try:
+        yield from _initialize(c)
+    finally:
+        c.close()
+
+def _initialize(c):
     c.row_factory = sqlite3.Row
     c.execute('PRAGMA journal_mode=WAL')
     c.executescript('''
     CREATE TABLE IF NOT EXISTS assets (
       id TEXT PRIMARY KEY, name TEXT NOT NULL, category TEXT NOT NULL,
       duration REAL NOT NULL, created_at TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS music (id TEXT PRIMARY KEY, name TEXT NOT NULL, duration REAL NOT NULL, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS jobs (
       id TEXT PRIMARY KEY, batch_id TEXT NOT NULL, status TEXT NOT NULL,
       progress INTEGER NOT NULL DEFAULT 0, request TEXT NOT NULL,
@@ -38,7 +48,8 @@ def connect():
       created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
     CREATE INDEX IF NOT EXISTS jobs_batch ON jobs(batch_id);
     ''')
-    return c
+    with c:
+        yield c
 
 class Storage(Protocol):
     """Cloud adapter must download to local_path and publish a local render atomically."""
@@ -141,9 +152,24 @@ def validate_batch(body, c):
     if planner == 'chat':
         from .ai import configuration
         configuration()
+    audio_mode = body.get('audio_mode', 'none')
+    if audio_mode not in ('none','tts_bgm'):
+        raise ValueError('audio_mode must be none or tts_bgm')
+    music_id = body.get('music_id')
+    volume = body.get('music_volume', .12)
+    if isinstance(volume, bool) or not isinstance(volume,(int,float)) or not math.isfinite(volume) or not 0 <= volume <= .5:
+        raise ValueError('music_volume must be from 0 to 0.5')
+    if audio_mode == 'tts_bgm':
+        if mode == 'none':
+            raise ValueError('AI 配音需要选择手写字幕或 AI 字幕作为朗读文案')
+        if not isinstance(music_id,str) or not c.execute('SELECT id FROM music WHERE id=?',(music_id,)).fetchone():
+            raise ValueError('请先上传并选择背景音乐')
+        from .audio import tts_config
+        tts_config()
     return {k: body[k] for k in ('asset_ids', 'count', 'duration', 'clip_seconds')} | {
         'category': category, 'planner': planner, 'subtitle_mode': mode,
-        'product_brief': brief.strip(), 'subtitle_lines': [x.strip() for x in lines]}
+        'product_brief': brief.strip(), 'subtitle_lines': [x.strip() for x in lines],
+        'audio_mode': audio_mode, 'music_id': music_id if audio_mode == 'tts_bgm' else None, 'music_volume': volume}
 
 
 def create_batch(body):

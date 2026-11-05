@@ -2,7 +2,7 @@
 
 Web 版 AI 信息流自动剪辑系统的最小可运行起点：上传商品素材，按类别批量创建任务，由独立 Worker 渲染并下载真实 MP4。
 
-**支持规则剪辑或可配置 AI 镜头规划，支持手写 / AI 文案字幕烧录和 SRT 下载。** 规则模式无需模型账号；AI 模式需自行配置兼容接口。类别由用户填写，不自动识别商品。默认每批 10 条，最多 20 条；短素材可能重复，不保证变体唯一。暂无语音转写、配音、配乐、转场，素材原音默认移除。
+**支持规则剪辑或可配置 AI 镜头规划，支持手写 / AI 文案字幕烧录和 SRT 下载。** 规则模式无需模型账号；AI 模式需自行配置兼容接口。类别由用户填写，不自动识别商品。默认每批 10 条，最多 20 条；短素材可能重复，不保证变体唯一。支持千问 AI 配音＋上传背景音乐；暂无语音转写或转场，素材原音默认移除。
 
 ## 最小架构
 
@@ -26,6 +26,7 @@ flowchart TD
 | `backend/core.py` | SQLite 模型、参数校验、Planner / Storage 接口与默认实现 |
 | `backend/ai.py` | Chat Completions 兼容模型调用与严格时间轴校验 |
 | `backend/subtitles.py` | 字幕时间轴、SRT 导出和安全 ASS 样式 |
+| `backend/audio.py` | 千问逐句 TTS、缓存、时间轴对齐、背景音乐循环与混音 |
 | `backend/media.py` | FFprobe 校验、FFmpeg 截取、编码和拼接 |
 | `backend/worker.py` | 持久任务消费、进度更新、失败处理和重启恢复 |
 | `tests/test_pipeline.py` | 真实 FFmpeg 端到端验证 |
@@ -132,7 +133,7 @@ Worker 通过 SQLite 事务领取任务；每个数据目录只运行一个 Work
 
 1. 上传落地并用 FFprobe 验证存在视频流、时长合法；无效文件删除。
 2. Planner 选择素材顺序、有效起点和时长，保存剪辑计划。
-3. FFmpeg 按计划截取并归一化：**720×1280，30fps，H.264，yuv420p，无音轨**；保持比例，空白处补黑边。
+3. FFmpeg 按计划截取并归一化：**720×1280，30fps，H.264，yuv420p（归一化阶段移除素材原音，随后可加配音＋配乐）**；保持比例，空白处补黑边。
 4. 将统一编码后的片段 concat；如启用字幕，生成 SRT / ASS 并用 libass 烧录，重新编码后设置 `+faststart`。
 5. FFprobe 验证成片；先复制到目标磁盘临时文件，再原子替换发布，最后更新 succeeded。
 6. 浏览器通过输出接口下载 MP4。每次 FFmpeg 调用超时为 300 秒，失败落库，可点击重试。
@@ -155,7 +156,7 @@ Worker 通过 SQLite 事务领取任务；每个数据目录只运行一个 Work
 
 MVP 不自动删除输入或成片，以支持重试；请监控磁盘，停机后备份或清理 data 目录。SQLite 数据目录不要使用网络共享盘。
 
-下一步建议顺序：真实商品素材与字幕验收 → 视觉分析 / 语音转写 → 配音 → 按实际并发升级存储和队列。
+下一步建议顺序：真实商品素材、字幕与声音验收 → 视觉分析 / 语音转写 → 按实际并发升级存储和队列。
 
 
 ## AI 模型接入与字幕使用
@@ -218,3 +219,66 @@ fc-list :lang=zh family
 ```
 
 如只要手写字幕，将 planner 改为 rules，subtitle_mode 改为 manual，subtitle_lines 填入字符串数组。旧请求缺省仍为 rules + none，无需迁移数据库；新参数保存在原有 request JSON，镜头 plan 新增 text 字段。
+
+
+## AI 配音＋背景音乐
+
+此功能输出带 **AAC 48kHz 双声道**音轨的 MP4：朗读字幕文案，叠加你上传的音乐。默认 `audio_mode=none`，旧请求与旧任务继续无声；要添加声音必须创建新批次。素材原音不参与这个组合。
+
+### Mac 更新现有项目
+
+1. 停止 Server 和 Worker，备份原项目目录。
+2. 下载 `codex/local-video-mvp` 分支的新代码，将其中 backend、frontend、tests、README.md、.env.example 更新到原项目。**保留原来的 .env 和整个 data 文件夹**；不要用示例覆盖密钥和 FFmpeg 路径。
+3. 按下文在原 .env 追加 TTS 配置。同名配置只留一份。
+4. 从原项目根目录分别启动 `python3 -m backend.server` 和 `python3 -m backend.worker`。刷新网页，应该出现声音、上传音乐和音乐选择控件。
+5. 如本机仍有已知的绝对路径数据库打开问题，可继续从项目根目录使用原临时 Worker 启动命令：`python3 -c 'from backend import core; core.DB = "data/cut.sqlite3"; from backend.worker import main; main()'`。
+
+数据库连接现在在每次事务结束后显式关闭，避免长期轮询依赖垃圾回收而累积连接；这修复连接生命周期问题，但不能保证解决所有本机路径 / 权限错误。
+
+### 千问 TTS 配置
+
+保留已经能工作的 CUT_LLM_*，另外追加以下配置（**北京地域示例**）：
+
+```dotenv
+CUT_TTS_URL=https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation
+CUT_TTS_MODEL=qwen3-tts-flash
+CUT_TTS_VOICE=Cherry
+CUT_TTS_API_KEY=替换成北京地域百炼API密钥
+```
+
+如果你现有千问密钥属于北京地域且有该语音模型权限，可将它填入 CUT_TTS_API_KEY；程序不会自动读取或复用聊天密钥。其他地域必须使用对应语音 endpoint 和密钥，不能把 Chat Completions 的 compatible-mode URL 直接填入 TTS URL。
+
+参考：[千问非实时语音合成官方文档](https://help.aliyun.com/zh/model-studio/qwen-tts-api)。默认是系统音色 Cherry，不涉及声音克隆。开通模型服务、可用地域、权限、额度和费用以你自己的百炼账号为准。真实外部模型尚未在本开发环境联调。
+
+### 网页操作
+
+1. 上传并勾选视频，选择 AI 规划和 AI 字幕，填写真实商品说明；也可使用手写字幕作为朗读文案。
+2. 声音选择“AI 配音＋背景音乐”。
+3. 选择本机 MP3 / WAV 等音频文件，点击“上传音乐”，确认下拉框已选中该文件。请使用有权使用的音乐；不自动搜索或下载歌曲。
+4. 音乐音量默认 12%（幅度系数，不是响度百分比），可调 0–50%。先生成一条 10–15 秒视频试听。
+5. 下载 MP4 播放；声音已嵌入视频，无需单独加载文件。
+
+配音根据每句字幕合成，与字幕时间窗口对齐。短音频末尾补静音；长音频保音高加速，最多 2 倍，超过后任务明确失败，提示缩短文案或延长时长，**不会截断句子**。AI 字幕需修改时可复制文案到手写字幕模式、缩短后新建批次。背景音乐自动循环至成片长度、降低音量、最后一秒淡出，混音有峰值限制；当前没有基于语音的动态 ducking。最终视频保持目标时长，不以音频长度延长。
+
+每句字幕各调用一次 TTS，费用可能随批次数和字幕句数增加。有效原始配音按 endpoint / model / voice / text 的哈希缓存在 data/tts，重试复用已有缓存；缓存写入前崩溃仍可能重复调用。仅字幕文本发送到 TTS，不发送音乐或原视频。不要把密钥填入网页。
+
+### 音频 API 与请求模型
+
+| API | 行为 |
+| --- | --- |
+| `POST /api/music?name=bgm.mp3` | 二进制音频上传，限制沿用 CUT_MAX_UPLOAD_MB；校验有音轨、时长0.05–3600秒 |
+| `GET /api/music` | 返回音乐 ID、名称、时长 |
+
+`POST /api/batches` 新增：
+
+```json
+{
+  "audio_mode": "tts_bgm",
+  "music_id": "上传音乐返回的id",
+  "music_volume": 0.12
+}
+```
+
+与原素材、类别、时长、字幕参数一起提交。音频模式可选 none / tts_bgm；tts_bgm 必须选择字幕模式、已有音乐、配置 TTS。music_volume 必须为有限数字 0–0.5。新增 music 表自动创建；request JSON 保存选项，无需删除旧数据库。TTS 或混音失败会使整条任务 failed，不会以无声视频冒充成功。
+
+验证包含本机模拟千问 TTS、音频下载、语音缓存、真实 FFmpeg 混音 / AAC 输出，以及解码频谱中分别检测代表语音和音乐的两种频率。模拟音频是测试音，不代表真实音色效果；中文发音、音色和真实服务权限需要你的账号完成试听。

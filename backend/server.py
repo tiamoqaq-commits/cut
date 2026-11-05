@@ -7,6 +7,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlsplit, parse_qs
 from .core import ROOT, connect, create_batch, job_json, now, providers
 from .media import probe
+from .audio import audio_duration
 
 class Handler(BaseHTTPRequestHandler):
     def json(self, code, value):
@@ -36,6 +37,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/api/health':
             return self.json(200, {'status': 'ok', 'default_planner': os.getenv('CUT_PLANNER', 'rules'), 'planners': ['rules', 'chat'], 'ai_configured': bool(os.getenv('CUT_LLM_BASE_URL') and os.getenv('CUT_LLM_MODEL')), 'worker': 'separate process'})
         with connect() as c:
+            if path == '/api/music':
+                return self.json(200, [dict(x) for x in c.execute('SELECT * FROM music ORDER BY created_at DESC')])
             if path == '/api/assets':
                 return self.json(200, [dict(x) for x in c.execute('SELECT * FROM assets ORDER BY created_at DESC')])
             if path == '/api/jobs':
@@ -63,10 +66,10 @@ class Handler(BaseHTTPRequestHandler):
                 return self.json(403, {'error': 'Cross-origin writes disabled'})
             size = int(self.headers.get('Content-Length', '0'))
             limit = int(os.getenv('CUT_MAX_UPLOAD_MB', '200')) * 1024 * 1024
-            if not 0 < size <= (limit if path == '/api/assets' else 65536):
+            if not 0 < size <= (limit if path in ('/api/assets','/api/music') else 65536):
                 self.close_connection = True
                 return self.json(413, {'error': 'Missing or oversized Content-Length'})
-            if path == '/api/assets':
+            if path in ('/api/assets','/api/music'):
                 q = parse_qs(urlsplit(self.path).query)
                 category = q.get('category', ['general'])[0]
                 name = q.get('name', ['video'])[0]
@@ -74,7 +77,7 @@ class Handler(BaseHTTPRequestHandler):
                     raise ValueError('Invalid category or name length')
                 id = uuid.uuid4().hex
                 storage = providers()[0]
-                target = storage.local_path('assets/' + id)
+                target = storage.local_path(('music/' if path == '/api/music' else 'assets/') + id)
                 try:
                     with target.open('wb') as f:
                         left = size
@@ -84,9 +87,12 @@ class Handler(BaseHTTPRequestHandler):
                                 raise ValueError('Incomplete upload')
                             f.write(chunk)
                             left -= len(chunk)
-                    duration = probe(target)
+                    duration = audio_duration(target) if path == '/api/music' else probe(target)
                     with connect() as c:
-                        c.execute('INSERT INTO assets VALUES(?,?,?,?,?)', (id, name, category, duration, now()))
+                        if path == '/api/music':
+                            c.execute('INSERT INTO music VALUES(?,?,?,?)', (id,name,duration,now()))
+                        else:
+                            c.execute('INSERT INTO assets VALUES(?,?,?,?,?)', (id, name, category, duration, now()))
                 except Exception:
                     target.unlink(missing_ok=True)
                     raise

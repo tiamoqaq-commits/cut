@@ -35,12 +35,13 @@ class ChatPlanner:
                     '每个镜头使用已有 asset_id，start>=0，start+duration<=素材时长。'
                     'duration>=0.1 且<=clip_seconds，所有 duration 之和必须等于目标 duration，最多600个镜头。'
                     '可重复素材。字幕模式为 ai 时每个镜头 text 为简短中文文案，单条最多48字；其他模式 text 为空。'
-                    '根据 variant 设计不同镜头顺序和文案。')},
+                    '根据 variant 设计不同镜头顺序和文案。audio_mode为tts_bgm时文案将被朗读，每秒最多约3个汉字，短镜头尤其要简短。')},
                 {'role': 'user', 'content': json.dumps({
                     'assets': [{k: a[k] for k in ('id', 'name', 'category', 'duration')} for a in assets],
                     'category': request['category'], 'product_brief': request.get('product_brief', ''),
                     'duration': request['duration'], 'clip_seconds': request['clip_seconds'],
                     'subtitle_mode': request.get('subtitle_mode', 'none'), 'variant': seed,
+                    'audio_mode': request.get('audio_mode', 'none'),
                 }, ensure_ascii=False)},
             ],
         }

@@ -8,6 +8,7 @@ from dataclasses import asdict
 from .core import DATA, Clip, connect, now, providers
 from .subtitles import cues_for
 from .media import render
+from .audio import add_audio
 
 logging.basicConfig(level=logging.INFO)
 
@@ -35,6 +36,7 @@ def process(job):
         with tempfile.TemporaryDirectory(prefix='cut-') as tmp:
             from pathlib import Path
             file = render(clips, storage, Path(tmp), update, cues_for(clips, req))
+            file = add_audio(file, cues_for(clips, req), req, storage, Path(tmp))
             key = f"outputs/{job['id']}.mp4"
             # Copy into destination filesystem first so replace is atomic across /tmp mounts.
             pending = storage.local_path(key + '.pending')
