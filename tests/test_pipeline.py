@@ -29,8 +29,8 @@ class ModelHandler(BaseHTTPRequestHandler):
         type(self).calls += 1
         assert self.path == '/v1/chat/completions'
         assert self.headers['Authorization'] == 'Bearer test-key'
-        plan={'clips':[{'asset_id':info['assets'][0]['id'],'start':0,'duration':1,'text':'Simple style'},
-                       {'asset_id':info['assets'][0]['id'],'start':1,'duration':1,'text':'Everyday detail'}]}
+        plan={'clips':[{'asset_id':info['assets'][0]['id'],'start':0,'duration':0.5,'text':'Simple style'},
+                       {'asset_id':info['assets'][0]['id'],'start':1,'duration':0.5,'text':'Everyday detail'}]}
         raw=json.dumps({'choices':[{'message':{'content':json.dumps(plan)}}]}).encode()
         self.send_response(200);self.send_header('Content-Length',str(len(raw)));self.end_headers();self.wfile.write(raw)
 

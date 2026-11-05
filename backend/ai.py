@@ -95,6 +95,49 @@ def validate_plan(result, assets, request, clip_type):
         if request.get('subtitle_mode') == 'ai' and not text.strip():
             raise ValueError('AI subtitle is empty')
         clips.append(clip_type(row['asset_id'], float(start), float(duration), text.strip()))
-    if abs(sum(x.duration for x in clips) - request['duration']) > .05:
-        raise ValueError('AI plan total duration does not match request')
-    return clips
+    return fit_timeline(clips, known, request, clip_type)
+
+
+def fit_timeline(clips, known, request, clip_type):
+    """Own duration arithmetic locally; never extend beyond an approved source cut.
+
+    Repeat approved cuts for coverage, then distribute the exact 30fps frame
+    budget across their capacities with a 3-frame minimum. No second AI call.
+    """
+    target = round(request['duration'] * 30)
+    template = []
+    for clip in clips:
+        cap = math.floor(min(clip.duration, known[clip.asset_id]['duration'] - clip.start,
+                             request['clip_seconds']) * 30 + 1e-7)
+        if cap < 3:
+            raise ValueError('AI clip has fewer than 3 usable video frames')
+        template.append((clip, cap))
+    chosen = []
+    capacity = 0
+    i = 0
+    while capacity < target:
+        clip, cap = template[i % len(template)]
+        chosen.append((clip, cap))
+        capacity += cap
+        i += 1
+        if len(chosen) > 600:
+            raise ValueError('Timeline exceeds 600 clips')
+    # Avoid creating sub-0.1s tail cues and retain the requested order.
+    chosen = chosen[:target // 3]
+    capacity = sum(cap for _, cap in chosen)
+    remaining = target - 3 * len(chosen)
+    weights = [cap - 3 for _, cap in chosen]
+    total_weight = sum(weights)
+    extras = [remaining * w / total_weight if total_weight else 0 for w in weights]
+    frames = [3 + math.floor(x) for x in extras]
+    left = target - sum(frames)
+    for index in sorted(range(len(frames)), key=lambda j: extras[j] % 1, reverse=True):
+        if not left:
+            break
+        if frames[index] < chosen[index][1]:
+            frames[index] += 1
+            left -= 1
+    if left or capacity < target:
+        raise ValueError('Cannot fit timeline within safe source bounds')
+    return [clip_type(c.asset_id, c.start, f / 30, c.text)
+            for (c, _), f in zip(chosen, frames)]

@@ -20,10 +20,25 @@ class AIValidation(unittest.TestCase):
     def test_bounds_and_untrusted_outputs(self):
         self.assertEqual(validate_plan(self.valid,self.assets,self.req,Clip)[0].text,'真实卖点')
         for changes in ({'asset_id':'other'},{'start':-1},{'start':3},{'duration':float('nan')},
-                        {'duration':True},{'duration':1},{'text':''},{'text':'x'*49}):
+                        {'duration':True},{'duration':0},{'text':''},{'text':'x'*49}):
             data={'clips':[self.valid['clips'][0]|changes]}
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 validate_plan(data,self.assets,self.req,Clip)
+
+    def test_fit_short_long_and_fractional_plans(self):
+        for durations,target in (([1],15),([2,2,2],2),([.1],60),([.31,.87],10),([2,.1],1)):
+            req=self.req | {'duration':target}
+            data={'clips':[{'asset_id':'a','start':1,'duration':d,'text':'文案'} for d in durations]}
+            with self.subTest(durations=durations,target=target):
+                result=validate_plan(data,self.assets,req,Clip)
+                self.assertEqual(sum(round(c.duration*30) for c in result),target*30)
+                self.assertAlmostEqual(sum(c.duration for c in result),target)
+                for clip in result:
+                    self.assertGreaterEqual(clip.duration,.1)
+                    self.assertLessEqual(clip.start+clip.duration,4)
+                    self.assertLessEqual(clip.duration,2)
+                    self.assertEqual(clip.text,'文案')
+                self.assertLessEqual(len(result),600)
 
     def test_caption_timeline_and_escaping(self):
         clips=[Clip('a',0,1),Clip('a',1,1)]
