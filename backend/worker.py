@@ -5,7 +5,8 @@ import os
 import tempfile
 import time
 from dataclasses import asdict
-from .core import DATA, connect, now, providers
+from .core import DATA, Clip, connect, now, providers
+from .subtitles import cues_for
 from .media import render
 
 logging.basicConfig(level=logging.INFO)
@@ -23,22 +24,29 @@ def process(job):
         with connect() as c:
             c.execute('UPDATE jobs SET progress=?,updated_at=? WHERE id=?', (progress, now(), job['id']))
     try:
-        storage, planner = providers()
         req = json.loads(job['request'])
+        storage, planner = providers(req.get('planner', 'rules'))
         with connect() as c:
             assets = [dict(c.execute('SELECT * FROM assets WHERE id=?', (x,)).fetchone()) for x in req['asset_ids']]
-        clips = planner.plan(assets, req, job['id'])
+        # Reuse a persisted AI plan after render failure or restart; no extra model charge.
+        clips = [Clip(**x) for x in json.loads(job['plan'])] if job.get('plan') else planner.plan(assets, req, job['id'])
         with connect() as c:
             c.execute('UPDATE jobs SET plan=? WHERE id=?', (json.dumps([asdict(x) for x in clips]), job['id']))
         with tempfile.TemporaryDirectory(prefix='cut-') as tmp:
             from pathlib import Path
-            file = render(clips, storage, Path(tmp), update)
+            file = render(clips, storage, Path(tmp), update, cues_for(clips, req))
             key = f"outputs/{job['id']}.mp4"
             # Copy into destination filesystem first so replace is atomic across /tmp mounts.
             pending = storage.local_path(key + '.pending')
             import shutil
             shutil.copyfile(file, pending)
             storage.publish(pending, key)
+            srt = Path(tmp) / 'captions.srt'
+            if srt.exists():
+                subtitle_key = f"outputs/{job['id']}.srt"
+                subtitle_pending = storage.local_path(subtitle_key + '.pending')
+                shutil.copyfile(srt, subtitle_pending)
+                storage.publish(subtitle_pending, subtitle_key)
         with connect() as c:
             c.execute("UPDATE jobs SET status='succeeded',progress=100,output_key=?,error=NULL,updated_at=? WHERE id=?", (key, now(), job['id']))
     except Exception as e:

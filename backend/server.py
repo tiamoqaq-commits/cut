@@ -17,14 +17,14 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
-    def file(self, path, kind, download=False):
+    def file(self, path, kind, download=False, filename='cut.mp4'):
         if not path.is_file():
             return self.json(404, {'error': 'Not found'})
         self.send_response(200)
         self.send_header('Content-Type', kind)
         self.send_header('Content-Length', str(path.stat().st_size))
         if download:
-            self.send_header('Content-Disposition', 'attachment; filename="cut.mp4"')
+            self.send_header('Content-Disposition', f'attachment; filename="{filename}"')
         self.end_headers()
         with path.open('rb') as f:
             shutil.copyfileobj(f, self.wfile)
@@ -34,7 +34,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == '/':
             return self.file(ROOT / 'frontend/index.html', 'text/html; charset=utf-8')
         if path == '/api/health':
-            return self.json(200, {'status': 'ok', 'planner': 'rules', 'worker': 'separate process'})
+            return self.json(200, {'status': 'ok', 'default_planner': os.getenv('CUT_PLANNER', 'rules'), 'planners': ['rules', 'chat'], 'ai_configured': bool(os.getenv('CUT_LLM_BASE_URL') and os.getenv('CUT_LLM_MODEL')), 'worker': 'separate process'})
         with connect() as c:
             if path == '/api/assets':
                 return self.json(200, [dict(x) for x in c.execute('SELECT * FROM assets ORDER BY created_at DESC')])
@@ -48,6 +48,8 @@ class Handler(BaseHTTPRequestHandler):
                 row = c.execute('SELECT * FROM jobs WHERE id=?', (parts[3],)).fetchone()
                 if row and len(parts) == 4:
                     return self.json(200, job_json(row))
+                if row and len(parts) == 5 and parts[4] == 'subtitles' and row['status'] == 'succeeded' and json.loads(row['request']).get('subtitle_mode', 'none') != 'none':
+                    return self.file(providers()[0].local_path(f"outputs/{row['id']}.srt"), 'application/x-subrip; charset=utf-8', True, 'cut.srt')
                 if row and len(parts) == 5 and parts[4] == 'output' and row['status'] == 'succeeded':
                     return self.file(providers()[0].local_path(row['output_key']), 'video/mp4', True)
         return self.json(404, {'error': 'Not found or output not ready'})

@@ -2,7 +2,7 @@
 
 Web 版 AI 信息流自动剪辑系统的最小可运行起点：上传商品素材，按类别批量创建任务，由独立 Worker 渲染并下载真实 MP4。
 
-**当前使用本地规则规划器，不调用 AI 模型。** 无需任何云账号或密钥。支持用户填写任意商品类别，但不自动识别商品。默认批量 10 条，最多 20 条；随机顺序和有效起点生成变体，短素材会重复，不保证变体唯一。首版无字幕、配音、配乐、转场，素材原音默认移除。
+**支持规则剪辑或可配置 AI 镜头规划，支持手写 / AI 文案字幕烧录和 SRT 下载。** 规则模式无需模型账号；AI 模式需自行配置兼容接口。类别由用户填写，不自动识别商品。默认每批 10 条，最多 20 条；短素材可能重复，不保证变体唯一。暂无语音转写、配音、配乐、转场，素材原音默认移除。
 
 ## 最小架构
 
@@ -24,6 +24,8 @@ flowchart TD
 | `frontend/index.html` | 上传、分类选择、批量生成、状态轮询、下载、失败重试 |
 | `backend/server.py` | 同源网页与 HTTP API |
 | `backend/core.py` | SQLite 模型、参数校验、Planner / Storage 接口与默认实现 |
+| `backend/ai.py` | Chat Completions 兼容模型调用与严格时间轴校验 |
+| `backend/subtitles.py` | 字幕时间轴、SRT 导出和安全 ASS 样式 |
 | `backend/media.py` | FFprobe 校验、FFmpeg 截取、编码和拼接 |
 | `backend/worker.py` | 持久任务消费、进度更新、失败处理和重启恢复 |
 | `tests/test_pipeline.py` | 真实 FFmpeg 端到端验证 |
@@ -32,7 +34,7 @@ flowchart TD
 
 ## 启动步骤
 
-要求 **Python 3.11+、FFmpeg、FFprobe**，FFmpeg 需带 `libx264`。支持 macOS、Linux；Windows 请用 WSL2（Worker 使用 POSIX 文件锁）。无需安装 Python 第三方包、Node.js 或云服务。
+要求 **Python 3.11+、FFmpeg、FFprobe**，FFmpeg 需带 `libx264` 和字幕用的 `libass`。中文烧录还需 fontconfig 和中文字体。支持 macOS、Linux；Windows 请用 WSL2（Worker 使用 POSIX 文件锁）。无需安装 Python 第三方包、Node.js 或云服务。
 
 先通过本机软件包管理器安装 Python 与 FFmpeg，再执行：
 
@@ -63,7 +65,7 @@ python3 -m backend.worker
 python3 -m unittest discover -s tests -v
 ```
 
-测试自动生成彩条视频，实际验证上传、非法文件拒绝、类别隔离、两条批量任务、API 重启后队列保留，以及下载视频的 H.264 编码、720×1280 分辨率和时长。不调用外部服务。
+测试自动生成彩条视频，实际验证上传、非法文件拒绝、类别隔离、规则 / 模拟 AI 批量任务、API 重启后队列保留，以及成片编码、分辨率、时长、字幕区域像素变化和 SRT 下载。单元测试检查非法模型计划、字幕转义与缺失字体。模型调用使用本机模拟服务，未验证真实外部账号。
 
 ## 环境变量
 
@@ -74,11 +76,11 @@ python3 -m unittest discover -s tests -v
 | `CUT_PORT` | 8000；API 固定只监听 127.0.0.1 |
 | `CUT_DATA_DIR` | 仓库根目录下 data；建议配置绝对本地路径 |
 | `CUT_MAX_UPLOAD_MB` | 200；单个上传文件大小上限 |
-| `CUT_PLANNER` | rules；当前只实现规则规划 |
+| `CUT_PLANNER` | rules；默认规划器，可设为 chat |
 | `CUT_STORAGE` | local；当前只实现本地存储 |
 | `FFMPEG_BIN` / `FFPROBE_BIN` | ffmpeg / ffprobe；可填写程序绝对路径 |
 
-没有预设模型供应商、对象存储、云地域或账号。填入未实现的 planner / storage 会明确启动失败，不会默默使用其他服务。
+没有预设模型供应商、对象存储、云地域或账号。planner 支持 rules / chat，storage 当前仅支持 local；其他值明确报错。
 
 ## 批量生成接口
 
@@ -92,6 +94,7 @@ python3 -m unittest discover -s tests -v
 | GET | `/api/jobs/{job_id}` | 单任务详情与剪辑计划 |
 | POST | `/api/jobs/{job_id}/retry` | 请求体 `{}`；仅失败任务可重新排队 |
 | GET | `/api/jobs/{job_id}/output` | 成功后下载 MP4 |
+| GET | `/api/jobs/{job_id}/subtitles` | 成功且启用字幕后下载 SRT |
 | GET | `/api/health` | API 可用性；不代表 Worker 已启动 |
 
 ```bash
@@ -123,14 +126,14 @@ curl -X POST http://127.0.0.1:8000/api/batches \
 
 SQLite 素材表保存 id、原始文件名、类别、时长、创建时间，真实文件名使用服务端 UUID。参数持久化，浏览器关闭不影响任务。单条失败不阻塞批次其他任务。
 
-Worker 通过 SQLite 事务领取任务；每个数据目录只运行一个 Worker，以文件锁防止重复启动。Worker 重启会将 running 任务重新排队，从头渲染，随机种子使用 job ID，因此同任务重试可复现规则计划。成片已发布但状态尚未更新时若崩溃，重试覆盖相同输出键。此版本不提供多机分布式锁或断点续渲。
+Worker 通过 SQLite 事务领取任务；每个数据目录只运行一个 Worker，以文件锁防止重复启动。Worker 重启会将 running 任务重新排队，从头渲染；已持久化的规划直接复用，不重复调用模型。模型响应成功但计划尚未入库时崩溃，重启仍可能再次调用模型。成片已发布但状态尚未更新时若崩溃，重试覆盖相同输出键。此版本不提供多机分布式锁或断点续渲。
 
 ## MP4 输出流程
 
 1. 上传落地并用 FFprobe 验证存在视频流、时长合法；无效文件删除。
 2. Planner 选择素材顺序、有效起点和时长，保存剪辑计划。
 3. FFmpeg 按计划截取并归一化：**720×1280，30fps，H.264，yuv420p，无音轨**；保持比例，空白处补黑边。
-4. 将统一编码后的片段 concat，设置 `+faststart` 前置 MP4 索引。
+4. 将统一编码后的片段 concat；如启用字幕，生成 SRT / ASS 并用 libass 烧录，重新编码后设置 `+faststart`。
 5. FFprobe 验证成片；先复制到目标磁盘临时文件，再原子替换发布，最后更新 succeeded。
 6. 浏览器通过输出接口下载 MP4。每次 FFmpeg 调用超时为 300 秒，失败落库，可点击重试。
 
@@ -138,13 +141,13 @@ Worker 通过 SQLite 事务领取任务；每个数据目录只运行一个 Work
 
 | 边界 | 当前实现 | 替换要求 |
 | --- | --- | --- |
-| `Planner.plan(assets, request, seed)` | RulePlanner，返回 `list[Clip]` | 任意模型或商品模板；接入时校验模型输出素材 ID、起止范围与资源预算 |
+| `Planner.plan(assets, request, seed)` | RulePlanner / ChatPlanner，返回 `list[Clip]` | 可接其他模型；现有 ChatPlanner 已校验素材 ID、有限时间值、单镜头时长、总时长和字幕长度 |
 | `Storage.local_path(key)` | 本地路径 | 云适配器负责把输入下载 / 缓存到本地 |
 | `Storage.publish(local_file, key)` | 原子替换本地文件 | 云适配器负责上传；输出下载接口可改为签名 URL |
 | 队列 / Repository | SQLite connect、claim、状态更新 | 扩展 PostgreSQL / Redis 时抽取 Repository，并增加租约、心跳、幂等 |
 | 渲染器 | 本地 FFmpeg | 可迁移受限容器或独立渲染服务，继续使用镜头计划契约 |
 
-实际装配点是 `backend/core.py` 的 `providers()`。模型、OSS / S3、消息队列均未实现，接入任一供应商时自行注册适配器并新增所需环境变量；不需要提前注册无关账号。
+实际装配点是 `backend/core.py` 的 `providers()`。ChatPlanner 已实现 Chat Completions 兼容接口；其他协议、OSS / S3、消息队列需自行注册适配器。无需提前注册无关账号。
 
 ## 当前使用边界
 
@@ -152,4 +155,66 @@ Worker 通过 SQLite 事务领取任务；每个数据目录只运行一个 Work
 
 MVP 不自动删除输入或成片，以支持重试；请监控磁盘，停机后备份或清理 data 目录。SQLite 数据目录不要使用网络共享盘。
 
-下一步建议顺序：真实商品素材验收 → 商品模板 → 字幕与配音 → AI 镜头选择 → 按实际并发升级存储和队列。
+下一步建议顺序：真实商品素材与字幕验收 → 视觉分析 / 语音转写 → 配音 → 按实际并发升级存储和队列。
+
+
+## AI 模型接入与字幕使用
+
+### 1. 配置兼容模型
+
+在 `.env` 中填写你已经选择的服务；无需把密钥提交到 Git 或输入网页：
+
+```dotenv
+CUT_LLM_BASE_URL=https://你的服务域名/v1
+CUT_LLM_MODEL=你的模型名称
+CUT_LLM_API_KEY=你的密钥
+CUT_LLM_TIMEOUT=90
+CUT_LLM_JSON_MODE=0
+CUT_SUBTITLE_FONT=Noto Sans CJK SC
+```
+
+`CUT_LLM_BASE_URL` 是 API 前缀，代码追加 `/chat/completions`。支持 HTTPS 服务或本机 HTTP（如 `http://127.0.0.1:1234/v1`）；本机无鉴权服务可留空密钥。选择支持 Chat Completions 的模型，不是所有模型协议都兼容；支持 JSON mode 时可设 `CUT_LLM_JSON_MODE=1`，否则保持 0，通过提示词要求 JSON 并在本地严格校验。接口参考：[Chat Completions](https://developers.openai.com/api/reference/resources/chat/subresources/completions/methods/create)。
+
+保存后重启 API 和 Worker。网页中选择“AI 规划”，填写真实商品说明和素材描述。选择 AI 字幕必须填写商品说明。默认不设置云服务或具体模型，不会读取 ChatGPT 订阅凭据。
+
+**模型实际收到的内容**：商品说明、类别、素材 ID、文件名、素材时长、目标时长、镜头时长和变体标识。不上传视频 / 音频，因此这是基于文本元数据的镜头规划与文案生成，不是视觉理解或原声语音转写。文件名若含私人信息也会随请求发送。
+
+每条 AI 成片调用一次模型，10 条通常对应 10 次请求，可能产生所选服务费用。无自动模型重试或静默回退。HTTP 错误、超时、非法 JSON、未知素材、越界时间轴、总时长不符会标记 failed。错误只记录状态码或通用说明，不保存供应商原始错误正文和密钥。有效计划先入库，后续渲染失败重试复用该计划；模型本身失败时，手动重试会重新请求。
+
+### 2. 安装字幕依赖
+
+确认 `ffmpeg -filters` 中有 `ass`。中文字体缺失时任务会给出明确错误，不会静默生成空白方块。Linux 可安装 `fontconfig` 与 `fonts-noto-cjk`，macOS 可使用安装好的中文字体并配置 family（如 `PingFang SC`），同时安装 fontconfig。验证命令：
+
+```bash
+fc-list :lang=zh family
+```
+
+`CUT_SUBTITLE_FONT` 填字体 family 名称，不是字体路径；libass 可使用系统字体回退。默认白字黑描边、底部居中、离底部 100 像素，每 18 字自动换行。字幕文本会转义 ASS 控制序列，无法注入位置或样式命令。
+
+### 3. 三种字幕模式
+
+| subtitle_mode | 网页选项 | 行为 |
+| --- | --- | --- |
+| none | 不添加 | 输出无字幕视频 |
+| manual | 手写字幕 | 每行一句，按最终成片时长均分；支持规则或 AI 规划 |
+| ai | AI 生成文案字幕 | 每个镜头生成一句文案，与镜头时间轴对齐；要求 planner=chat 和商品说明 |
+
+手写最多 60 句，每句 1–48 字，平均每句至少 0.5 秒。AI 每句最多 48 字；可在任务详情中查看镜头和字幕，并下载 SRT。字幕已硬烧录进 MP4，即使播放器不加载 SRT 也可见。该版本没有字幕编辑后重新渲染按钮；修改文案请以 manual 模式新建批次。AI 文案需核对真实性；预览详情不代表已人工审核。
+
+新增请求示例：
+
+```json
+{
+  "asset_ids": ["上传得到的素材ID"],
+  "category": "手串",
+  "count": 10,
+  "duration": 15,
+  "clip_seconds": 3,
+  "planner": "chat",
+  "product_brief": "紫金鼠素串，焦糖棕色。closeup.mp4 是珠子特写。",
+  "subtitle_mode": "ai",
+  "subtitle_lines": []
+}
+```
+
+如只要手写字幕，将 planner 改为 rules，subtitle_mode 改为 manual，subtitle_lines 填入字符串数组。旧请求缺省仍为 rules + none，无需迁移数据库；新参数保存在原有 request JSON，镜头 plan 新增 text 字段。

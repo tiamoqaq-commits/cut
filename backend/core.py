@@ -61,6 +61,7 @@ class Clip:
     asset_id: str
     start: float
     duration: float
+    text: str = ""
 
 class Planner(Protocol):
     def plan(self, assets: list[dict], request: dict, seed: str) -> list[Clip]: ...
@@ -83,19 +84,25 @@ class RulePlanner:
             i += 1
         return clips
 
-def providers():
-    # Fail closed: selecting an unimplemented provider must never silently use local.
+def providers(planner_name=None):
     if os.getenv('CUT_STORAGE', 'local') != 'local':
         raise ValueError('Storage adapter not implemented; use CUT_STORAGE=local')
-    if os.getenv('CUT_PLANNER', 'rules') != 'rules':
-        raise ValueError('Planner adapter not implemented; use CUT_PLANNER=rules')
-    return LocalStorage(), RulePlanner()
+    name = planner_name or os.getenv('CUT_PLANNER', 'rules')
+    if name == 'rules':
+        planner = RulePlanner()
+    elif name == 'chat':
+        from .ai import ChatPlanner
+        planner = ChatPlanner()
+    else:
+        raise ValueError('Unknown planner; choose rules or chat')
+    return LocalStorage(), planner
 
 def job_json(row):
     d = dict(row)
     d['request'] = json.loads(d['request'])
     d['plan'] = json.loads(d['plan']) if d['plan'] else None
     d['download_url'] = '/api/jobs/' + d['id'] + '/output' if d['status'] == 'succeeded' else None
+    d['subtitles_url'] = '/api/jobs/' + d['id'] + '/subtitles' if d['status'] == 'succeeded' and d['request'].get('subtitle_mode', 'none') != 'none' else None
     return d
 
 def validate_batch(body, c):
@@ -117,7 +124,27 @@ def validate_batch(body, c):
         raise ValueError('Unknown asset ID')
     if any(r['category'] != category for r in rows):
         raise ValueError('All assets must match the batch category')
-    return {k: body[k] for k in ('asset_ids', 'count', 'duration', 'clip_seconds')} | {'category': category}
+    planner = body.get('planner', os.getenv('CUT_PLANNER', 'rules'))
+    mode = body.get('subtitle_mode', 'none')
+    brief = body.get('product_brief', '')
+    lines = body.get('subtitle_lines', [])
+    if planner not in ('rules', 'chat') or mode not in ('none', 'manual', 'ai'):
+        raise ValueError('Invalid planner or subtitle_mode')
+    if not isinstance(brief, str) or len(brief) > 2000:
+        raise ValueError('product_brief must be a string of up to 2000 characters')
+    if not isinstance(lines, list) or len(lines) > 60 or any(not isinstance(x, str) or not 1 <= len(x.strip()) <= 48 or any(ord(c) < 32 for c in x) for x in lines):
+        raise ValueError('subtitle_lines: up to 60 single lines, each 1–48 characters')
+    if mode == 'manual' and (not lines or len(lines) > body['duration'] * 2):
+        raise ValueError('Manual subtitles need at least one line and at least 0.5 seconds per line')
+    if mode == 'ai' and (planner != 'chat' or not brief.strip()):
+        raise ValueError('AI subtitles require chat planner and a product brief')
+    if planner == 'chat':
+        from .ai import configuration
+        configuration()
+    return {k: body[k] for k in ('asset_ids', 'count', 'duration', 'clip_seconds')} | {
+        'category': category, 'planner': planner, 'subtitle_mode': mode,
+        'product_brief': brief.strip(), 'subtitle_lines': [x.strip() for x in lines]}
+
 
 def create_batch(body):
     with connect() as c:
